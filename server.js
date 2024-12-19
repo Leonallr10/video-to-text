@@ -1,3 +1,4 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -28,6 +29,69 @@ const assemblyAI = new AssemblyAI({
 const audioCache = new Map();
 const liveStreams = new Map();
 
+// Platform detection utility
+const detectPlatform = (url) => {
+    try {
+        const urlObj = new URL(url);
+        const domain = urlObj.hostname.toLowerCase();
+        
+        if (domain.includes('youtube.com') || domain.includes('youtu.be')) {
+            return 'youtube';
+        } else if (domain.includes('instagram.com')) {
+            return 'instagram';
+        } else if (domain.includes('facebook.com') || domain.includes('fb.com')) {
+            return 'facebook';
+        } else if (domain.includes('tiktok.com')) {
+            return 'tiktok';
+        } else if (domain.includes('twitter.com')) {
+            return 'twitter';
+        } else if (domain.includes('vimeo.com')) {
+            return 'vimeo';
+        }
+        return 'unknown';
+    } catch (error) {
+        throw new Error('Invalid URL format');
+    }
+};
+
+// Platform-specific download configurations
+const getPlatformConfig = (platform, isLive = false) => {
+    const baseConfig = [
+        '-x',
+        '--audio-format', 'mp3',
+        '--output', '-',
+        '--no-playlist',
+    ];
+
+    // Platform-specific configurations
+    const configs = {
+        instagram: [...baseConfig, 
+            '--add-header', 'User-Agent:Mozilla/5.0',
+            '--cookies-from-browser', 'chrome'
+        ],
+        facebook: [...baseConfig, 
+            '--add-header', 'Cookie:',
+            '--cookies-from-browser', 'chrome'
+        ],
+        tiktok: [...baseConfig, 
+            '--user-agent', 'Mozilla/5.0',
+            '--cookies-from-browser', 'chrome'
+        ],
+        twitter: [...baseConfig, '--cookies-from-browser', 'chrome'],
+        vimeo: [...baseConfig],
+        youtube: [...baseConfig],
+        unknown: [...baseConfig]
+    };
+
+    const config = configs[platform] || configs.unknown;
+    
+    if (isLive) {
+        config.push('--live-from-start');
+    }
+
+    return config;
+};
+
 // Utility: Buffer to Stream conversion
 const bufferToStream = (buffer) => {
     const readable = new stream.Readable();
@@ -37,9 +101,64 @@ const bufferToStream = (buffer) => {
     return readable;
 };
 
+// Enhanced video download function
+const downloadVideo = async (url, isLive = false) => {
+    try {
+        const platform = detectPlatform(url);
+        console.log(`Detected platform: ${platform}`);
+
+        const config = getPlatformConfig(platform, isLive);
+        const ffmpegPath = process.env.FFMPEG_PATH || 'C:\\Program Files\\FFmpeg\\bin';
+
+        return new Promise((resolve, reject) => {
+            const audioChunks = [];
+            let isAudioData = false;
+
+            const ytDlpProcess = spawn('yt-dlp', [
+                ...config,
+                '--ffmpeg-location', ffmpegPath,
+                url
+            ]);
+
+            ytDlpProcess.stdout.on('data', (chunk) => {
+                isAudioData = true;
+                audioChunks.push(chunk);
+            });
+
+            ytDlpProcess.stderr.on('data', (data) => {
+                const message = data.toString();
+                if (message.includes('Error') && 
+                    !message.includes('[download]') && 
+                    !message.includes(`[${platform}]`) && 
+                    !message.includes('[info]')) {
+                    console.error(`${platform} Download Error:`, message);
+                } else {
+                    console.log(`${platform} Download Progress:`, message);
+                }
+            });
+
+            ytDlpProcess.on('close', (code) => {
+                if (code === 0 && isAudioData) {
+                    const audioBuffer = Buffer.concat(audioChunks);
+                    resolve({ audioBuffer, platform });
+                } else {
+                    reject(new Error(`Download failed for ${platform} with code ${code}. No audio data received.`));
+                }
+            });
+
+            ytDlpProcess.on('error', (error) => {
+                console.error(`${platform} Process Error:`, error);
+                reject(error);
+            });
+        });
+    } catch (error) {
+        throw new Error(`Failed to process ${url}: ${error.message}`);
+    }
+};
+
 // Utility: Sliding Window Buffer for Live Streams
 class SlidingBuffer {
-    constructor(maxDuration = 10) { // 10 seconds default
+    constructor(maxDuration = 10) {
         this.maxDuration = maxDuration;
         this.chunks = [];
         this.totalDuration = 0;
@@ -65,76 +184,21 @@ class SlidingBuffer {
     }
 }
 
-// YouTube Audio Download Function
-const downloadYoutubeAudio = (url, isLive = false) => {
-    return new Promise((resolve, reject) => {
-        const ffmpegPath = process.env.FFMPEG_PATH || 'C:\\Program Files\\FFmpeg\\bin';
-        const audioChunks = [];
-        let isAudioData = false;
-
-        const options = [
-            '-x',
-            '--audio-format', 'mp3',
-            '--output', '-',
-            '--no-playlist',
-            '--ffmpeg-location', ffmpegPath
-        ];
-
-        if (isLive) {
-            options.push('--live-from-start');
-        }
-
-        const ytDlpProcess = spawn('yt-dlp', [...options, url]);
-
-        ytDlpProcess.stdout.on('data', (chunk) => {
-            isAudioData = true;
-            audioChunks.push(chunk);
-        });
-
-        ytDlpProcess.stderr.on('data', (data) => {
-            const message = data.toString();
-            if (message.includes('Error') && !message.includes('[download]') && !message.includes('[youtube]') && !message.includes('[info]')) {
-                console.error('Download Error:', message);
-            } else {
-                console.log('Download Progress:', message);
-            }
-        });
-
-        ytDlpProcess.on('close', (code) => {
-            if (code === 0 && isAudioData) {
-                const audioBuffer = Buffer.concat(audioChunks);
-                resolve(audioBuffer);
-            } else {
-                reject(new Error(`Download failed with code ${code}. No audio data received.`));
-            }
-        });
-
-        ytDlpProcess.on('error', (error) => {
-            console.error('Process Error:', error);
-            reject(error);
-        });
-    });
-};
-
-// Live Stream Processing Function
+// Enhanced live stream processing
 const processLiveStream = async (url, ws, language) => {
+    const platform = detectPlatform(url);
     const slidingBuffer = new SlidingBuffer();
     let currentStream = null;
 
     try {
-        currentStream = spawn('yt-dlp', [
-            '-x',
-            '--audio-format', 'mp3',
-            '--output', '-',
-            '--live-from-start',
-            url
-        ]);
+        const config = getPlatformConfig(platform, true);
+        currentStream = spawn('yt-dlp', config.concat([url]));
 
         currentStream.stdout.on('data', async (chunk) => {
             try {
-                slidingBuffer.addChunk(chunk, 1); // Assume 1 second per chunk
+                slidingBuffer.addChunk(chunk, 1);
 
-                if (slidingBuffer.totalDuration >= 10) { // Process every 10 seconds
+                if (slidingBuffer.totalDuration >= 10) {
                     const audioBuffer = slidingBuffer.getBuffer();
                     
                     const audioFile = await assemblyAI.files.upload(
@@ -153,6 +217,7 @@ const processLiveStream = async (url, ws, language) => {
                     ws.send(JSON.stringify({
                         type: 'transcription',
                         text: transcript.text,
+                        platform,
                         timestamp: Date.now()
                     }));
 
@@ -163,13 +228,14 @@ const processLiveStream = async (url, ws, language) => {
                 ws.send(JSON.stringify({
                     type: 'error',
                     error: 'Stream processing failed',
+                    platform,
                     details: error.message
                 }));
             }
         });
 
         currentStream.stderr.on('data', (data) => {
-            console.log('Stream progress:', data.toString());
+            console.log(`${platform} stream progress:`, data.toString());
         });
 
         return currentStream;
@@ -179,7 +245,7 @@ const processLiveStream = async (url, ws, language) => {
     }
 };
 
-// Recorded Video Transcription Endpoint
+// Enhanced recorded video transcription endpoint
 app.post('/api/transcribe-recorded', async (req, res) => {
     const { video_url, language = 'en' } = req.body;
 
@@ -188,44 +254,43 @@ app.post('/api/transcribe-recorded', async (req, res) => {
     }
 
     try {
-        console.log('Processing recorded video:', video_url);
+        const platform = detectPlatform(video_url);
+        console.log(`Processing ${platform} video:`, video_url);
         
-        // Download audio
-        const audioBuffer = await downloadYoutubeAudio(video_url, false);
-        const cacheKey = `youtube-${Date.now()}`;
+        const { audioBuffer } = await downloadVideo(video_url, false);
+        const cacheKey = `${platform}-${Date.now()}`;
         audioCache.set(cacheKey, audioBuffer);
 
-        console.log('Successfully downloaded audio, size:', audioBuffer.length);
+        console.log(`Successfully downloaded ${platform} audio, size:`, audioBuffer.length);
         
-        // Upload to AssemblyAI
         const audioFile = await assemblyAI.files.upload(bufferToStream(audioBuffer), {
             fileName: 'audio.mp3',
             contentType: 'audio/mp3'
         });
 
-        console.log('Successfully uploaded to AssemblyAI');
-
-        // Get transcription
         const transcript = await assemblyAI.transcripts.transcribe({
             audio: audioFile,
             language_code: language
         });
 
-        // Clean up cache
         audioCache.delete(cacheKey);
-        console.log('Cleaned up cache');
-
-        res.json({ text: transcript.text });
+        
+        res.json({ 
+            text: transcript.text,
+            platform,
+            success: true
+        });
     } catch (error) {
         console.error('Transcription Error:', error);
         res.status(500).json({
             error: 'Failed to transcribe video',
-            details: error.message
+            details: error.message,
+            platform: detectPlatform(video_url)
         });
     }
 });
 
-// WebSocket Handler for Live Streams
+// WebSocket handler for live streams
 wss.on('connection', (ws) => {
     console.log('New WebSocket connection established');
     let currentStream = null;
@@ -235,22 +300,22 @@ wss.on('connection', (ws) => {
             const data = JSON.parse(message);
 
             if (data.type === 'start_live') {
-                console.log('Starting live stream processing:', data.url);
+                const platform = detectPlatform(data.url);
+                console.log(`Starting live stream processing for ${platform}:`, data.url);
 
-                // Cleanup existing stream if any
                 if (currentStream) {
                     currentStream.kill();
                 }
 
-                // Start new stream processing
                 currentStream = await processLiveStream(data.url, ws, data.language);
                 
-                const streamKey = `live-${Date.now()}`;
+                const streamKey = `${platform}-live-${Date.now()}`;
                 liveStreams.set(streamKey, currentStream);
 
                 ws.send(JSON.stringify({
                     type: 'status',
-                    message: 'Live stream processing started'
+                    message: `Live stream processing started for ${platform}`,
+                    platform
                 }));
             }
         } catch (error) {
@@ -271,18 +336,18 @@ wss.on('connection', (ws) => {
     });
 });
 
-// Cache Management Endpoint
+// Cache management endpoint
 app.post('/api/clear-cache', (req, res) => {
     audioCache.clear();
     res.json({ message: 'Cache cleared successfully' });
 });
 
-// Health Check Endpoint
+// Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Error Handler
+// Error handler
 app.use((err, req, res, next) => {
     console.error('Server Error:', err);
     res.status(500).json({
@@ -291,7 +356,7 @@ app.use((err, req, res, next) => {
     });
 });
 
-// Start Server
+// Start server
 server.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
 });
