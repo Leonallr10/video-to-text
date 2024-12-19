@@ -1,3 +1,4 @@
+// script.js
 const WS_URL = 'ws://localhost:3000';
 const API_URL = 'http://localhost:3000';
 
@@ -12,7 +13,8 @@ const elements = {
     loadingMessage: document.getElementById('loadingMessage'),
     transcriptionResult: document.getElementById('transcriptionResult'),
     errorMessage: document.getElementById('errorMessage'),
-    statusMessage: document.getElementById('statusMessage')
+    statusMessage: document.getElementById('statusMessage'),
+    platformIndicator: document.getElementById('platformIndicator')
 };
 
 // State Management
@@ -20,6 +22,40 @@ let ws = null;
 let isLiveTranscribing = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
+
+// Platform detection (client-side version)
+const detectPlatform = (url) => {
+    try {
+        const urlObj = new URL(url);
+        const domain = urlObj.hostname.toLowerCase();
+        
+        if (domain.includes('youtube.com') || domain.includes('youtu.be')) {
+            return 'YouTube';
+        } else if (domain.includes('instagram.com')) {
+            return 'Instagram';
+        } else if (domain.includes('facebook.com') || domain.includes('fb.com')) {
+            return 'Facebook';
+        } else if (domain.includes('tiktok.com')) {
+            return 'TikTok';
+        } else if (domain.includes('twitter.com')) {
+            return 'Twitter';
+        } else if (domain.includes('vimeo.com')) {
+            return 'Vimeo';
+        }
+        return 'Unknown Platform';
+    } catch {
+        return 'Invalid URL';
+    }
+};
+
+// Update platform indicator
+const updatePlatformIndicator = (url) => {
+    const platform = detectPlatform(url);
+    if (elements.platformIndicator) {
+        elements.platformIndicator.textContent = `Platform: ${platform}`;
+        elements.platformIndicator.classList.remove('hidden');
+    }
+};
 
 // Utility Functions
 const showError = (message, duration = 5000) => {
@@ -59,12 +95,16 @@ const updateTranscription = (text, append = false) => {
 
 const clearTranscription = () => {
     elements.transcriptionResult.innerHTML = '';
+    if (elements.platformIndicator) {
+        elements.platformIndicator.classList.add('hidden');
+    }
 };
 
 const validateUrl = (url) => {
     try {
         new URL(url);
-        return true;
+        const platform = detectPlatform(url);
+        return platform !== 'Invalid URL';
     } catch {
         return false;
     }
@@ -91,6 +131,9 @@ const setupWebSocket = () => {
             switch (data.type) {
                 case 'transcription':
                     updateTranscription(data.text, true);
+                    if (data.platform) {
+                        updatePlatformIndicator(data.platform);
+                    }
                     break;
                 case 'status':
                     showStatus(data.message);
@@ -128,6 +171,8 @@ const setupWebSocket = () => {
 // API Functions
 const transcribeRecorded = async (videoUrl, language) => {
     try {
+        updatePlatformIndicator(videoUrl);
+        
         const response = await fetch(`${API_URL}/api/transcribe-recorded`, {
             method: 'POST',
             headers: {
@@ -146,7 +191,7 @@ const transcribeRecorded = async (videoUrl, language) => {
         }
 
         updateTranscription(data.text);
-        showStatus('Transcription completed successfully');
+        showStatus(`Transcription completed successfully for ${data.platform}`);
     } catch (error) {
         console.error('Transcription error:', error);
         showError(error.message);
@@ -163,6 +208,7 @@ const startLiveTranscription = (videoUrl, language) => {
     isLiveTranscribing = true;
     elements.stopButton.classList.remove('hidden');
     elements.startButton.classList.add('hidden');
+    updatePlatformIndicator(videoUrl);
 
     ws.send(JSON.stringify({
         type: 'start_live',
@@ -196,7 +242,7 @@ const validateForm = () => {
     }
 
     if (!validateUrl(videoUrl)) {
-        showError('Please enter a valid URL');
+        showError('Please enter a valid URL from a supported platform');
         return false;
     }
 
@@ -241,6 +287,7 @@ elements.videoType.addEventListener('change', () => {
 
 elements.videoUrl.addEventListener('input', () => {
     elements.errorMessage.classList.add('hidden');
+    updatePlatformIndicator(elements.videoUrl.value);
 });
 
 // Handle page visibility changes
